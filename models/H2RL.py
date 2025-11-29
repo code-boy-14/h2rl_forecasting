@@ -120,26 +120,39 @@ class Model(nn.Module):
         )
 
         # Reconstruction using weighted aggregation
+        # similarity_matrix: (bs, bs) where bs might be 2*batch_size due to augmentation
+        actual_bs = similarity_matrix.shape[0]
+        
+        # Create rebuild weight matrix
         rebuild_weight_matrix = torch.softmax(similarity_matrix / self.configs.temperature, dim=-1)
         rebuild_weight_matrix = rebuild_weight_matrix - torch.eye(rebuild_weight_matrix.shape[0]).to(x_enc.device) * 1e12
+        rebuild_weight_matrix = torch.softmax(rebuild_weight_matrix / self.configs.temperature, dim=-1)
         
-        # Aggregate multi-domain representations
-        combined_nodes = torch.cat([
-            time_nodes.mean(dim=1),
-            freq_nodes.mean(dim=1),
-            stat_nodes.mean(dim=1)
-        ], dim=-1)
+        # Aggregate multi-domain representations for reconstruction
+        # time_nodes: (bs, seq_len, n_vars, d_model)
+        # We need to flatten to (bs, seq_len * n_vars, d_model) then aggregate
         
-        aggregated = torch.matmul(rebuild_weight_matrix, combined_nodes)
+        # Reshape nodes to (actual_bs, seq_len, n_vars, d_model)
+        time_nodes_flat = time_nodes.reshape(actual_bs, seq_len, n_vars, self.d_model)
         
-        # Reconstruct
-        dec_out = self.reconstruction_head(aggregated)
-        dec_out = dec_out.view(bs, seq_len, n_vars)
+        # Average across d_model to get (actual_bs, seq_len, n_vars)
+        time_repr_spatial = time_nodes_flat.mean(dim=-1)  # (actual_bs, seq_len, n_vars)
+        
+        # Apply similarity-based reconstruction
+        # Reshape for batch-wise reconstruction
+        time_repr_flat = time_repr_spatial.reshape(actual_bs, -1)  # (actual_bs, seq_len*n_vars)
+        
+        # Weighted aggregation across batch
+        reconstructed_flat = torch.matmul(rebuild_weight_matrix, time_repr_flat)  # (actual_bs, seq_len*n_vars)
+        
+        # Reshape back
+        dec_out = reconstructed_flat.reshape(actual_bs, seq_len, n_vars)
 
         # De-normalization
         dec_out = dec_out * stdev
         dec_out = dec_out + means
 
+        # Use only the first batch_x.shape[0] samples for reconstruction loss
         pred_batch_x = dec_out[:batch_x.shape[0]]
         loss_rb = self.mse(pred_batch_x, batch_x.detach())
 
@@ -198,10 +211,14 @@ class Model(nn.Module):
 
     def aggregate_representations(self, time_nodes, freq_nodes, stat_nodes):
         """Aggregate multi-domain node representations for series-level representation"""
-        # Global pooling across each domain
-        time_repr = time_nodes.mean(dim=1)  # (bs, d_model)
-        freq_repr = freq_nodes.mean(dim=1)
-        stat_repr = stat_nodes.mean(dim=1)
+        # time_nodes: (bs, seq_len, enc_in, d_model)
+        # freq_nodes: (bs, n_freq_modes, enc_in, d_model)
+        # stat_nodes: (bs, 3, enc_in, d_model)
+        
+        # Global pooling across sequence and variable dimensions for each domain
+        time_repr = time_nodes.mean(dim=(1, 2))  # (bs, d_model)
+        freq_repr = freq_nodes.mean(dim=(1, 2))  # (bs, d_model)
+        stat_repr = stat_nodes.mean(dim=(1, 2))  # (bs, d_model)
         
         # Concatenate all domains
         return torch.cat([time_repr, freq_repr, stat_repr], dim=-1)  # (bs, 3*d_model)
@@ -274,12 +291,22 @@ class MultiDomainHypergraphEncoder(nn.Module):
         # Simple trend estimation (linear regression coefficient)
         time_indices = torch.arange(seq_len).float().to(x.device).view(1, -1, 1)
         trend_stats = ((masked_x * time_indices * mask).sum(dim=1, keepdim=True) / n_obs - 
-                      mean_stats * time_indices.mean())
+                    mean_stats * time_indices.mean())
         
         stat_features = torch.cat([mean_stats, var_stats, trend_stats], dim=1)  # (bs, 3, enc_in)
-        stat_nodes = self.stat_node_encoder(
-            stat_features.transpose(1, 2).unsqueeze(-1)
-        ).squeeze(-1).transpose(1, 2)  # (bs, 3, enc_in, d_model)
+        
+        # FIX: Correct reshaping for stat_node_encoder
+        # stat_features shape: (bs, 3, enc_in)
+        # We need to reshape to (bs, enc_in, 3) then encode to (bs, enc_in, d_model)
+        # Then reshape back to (bs, 3, enc_in, d_model) to match other node types
+        
+        stat_features_reshaped = stat_features.transpose(1, 2)  # (bs, enc_in, 3)
+        stat_nodes = self.stat_node_encoder(stat_features_reshaped)  # (bs, enc_in, d_model)
+        
+        # Reshape to match expected output: (bs, 3, enc_in, d_model)
+        # We have one representation per variable, but we need 3 statistical node types
+        # Solution: repeat across the first dimension to create 3 statistical perspectives
+        stat_nodes = stat_nodes.unsqueeze(1).repeat(1, 3, 1, 1)  # (bs, 3, enc_in, d_model)
         stat_nodes = self.activation(stat_nodes)
 
         # === HYPEREDGE CONSTRUCTION ===
@@ -498,32 +525,42 @@ class MetaAdaptationNetwork(nn.Module):
     def forward(self, x, mask):
         """
         x: (bs, seq_len, enc_in)
+        mask: (bs, seq_len, enc_in)
         Returns: (bs, n_hyperedge_types) weights
         """
-        bs = x.shape[0]
+        bs, seq_len, enc_in = x.shape
 
         # Compute statistical features
         masked_x = x * mask
-        n_obs = mask.sum(dim=(1, 2), keepdim=True).clamp(min=1)
+        n_obs = mask.sum(dim=(1, 2), keepdim=False).clamp(min=1)  # (bs,)
 
-        mean_feat = (masked_x.sum(dim=(1, 2)) / n_obs.squeeze()).unsqueeze(-1)
-        var_feat = (((masked_x - mean_feat.unsqueeze(1).unsqueeze(2)) ** 2 * mask).sum(dim=(1, 2)) / n_obs.squeeze()).unsqueeze(-1)
+        # Mean feature: average across all timesteps and variables
+        mean_feat = masked_x.sum(dim=(1, 2)) / n_obs  # (bs,)
+        mean_feat = mean_feat.unsqueeze(-1)  # (bs, 1)
+        
+        # Variance feature: compute variance properly
+        # First get mean per sample for broadcasting
+        mean_broadcast = (masked_x.sum(dim=(1, 2), keepdim=True) / n_obs.view(bs, 1, 1))  # (bs, 1, 1)
+        var_feat = (((masked_x - mean_broadcast) ** 2 * mask).sum(dim=(1, 2)) / n_obs).unsqueeze(-1)  # (bs, 1)
         
         # Simple spectral entropy approximation
-        x_fft = torch.fft.rfft(x, dim=1)
+        x_fft = torch.fft.rfft(x, dim=1)  # (bs, freq_bins, enc_in)
         power_spectrum = torch.abs(x_fft) ** 2
-        power_spectrum = power_spectrum / power_spectrum.sum(dim=1, keepdim=True).clamp(min=1e-8)
-        spectral_entropy = -(power_spectrum * torch.log(power_spectrum + 1e-8)).sum(dim=1).mean(dim=1, keepdim=True)
+        power_spectrum_sum = power_spectrum.sum(dim=1, keepdim=True).clamp(min=1e-8)  # (bs, 1, enc_in)
+        power_spectrum = power_spectrum / power_spectrum_sum
+        spectral_entropy = -(power_spectrum * torch.log(power_spectrum + 1e-8)).sum(dim=1).mean(dim=1, keepdim=True)  # (bs, 1)
         
         # Trend (simple linear coefficient)
-        time_indices = torch.arange(x.shape[1]).float().to(x.device).view(1, -1, 1)
-        trend_feat = ((masked_x * time_indices * mask).sum(dim=(1, 2)) / n_obs.squeeze()).unsqueeze(-1)
+        time_indices = torch.arange(seq_len).float().to(x.device).view(1, -1, 1)  # (1, seq_len, 1)
+        time_mean = time_indices.mean()
+        trend_feat = ((masked_x * time_indices * mask).sum(dim=(1, 2)) / n_obs).unsqueeze(-1)  # (bs, 1)
 
-        stat_features = torch.cat([mean_feat, var_feat, spectral_entropy, trend_feat], dim=-1)
+        # Concatenate all statistical features
+        stat_features = torch.cat([mean_feat, var_feat, spectral_entropy, trend_feat], dim=-1)  # (bs, 4)
 
         # Get hyperedge weights
-        encoded = self.stat_encoder(stat_features)
-        weights = self.meta_net(encoded)
+        encoded = self.stat_encoder(stat_features)  # (bs, 64)
+        weights = self.meta_net(encoded)  # (bs, n_hyperedge_types)
 
         return weights
 
@@ -546,34 +583,58 @@ class StructuralContrastiveLearning(nn.Module):
     def forward(self, series_repr, incidence_matrices, mask):
         """
         series_repr: (bs, 3*d_model) - concatenated multi-domain representations
+        incidence_matrices: dict containing hypergraph structure info
+        mask: (bs, seq_len, enc_in) - masking pattern
         """
+        # Ensure series_repr is 2D
+        if series_repr.dim() > 2:
+            series_repr = series_repr.reshape(series_repr.shape[0], -1)
+        
+        bs = series_repr.shape[0]
+        
         # Project to contrastive space
         z = self.projection(series_repr)  # (bs, 128)
         z = F.normalize(z, dim=1)
 
         # Compute similarity matrix
-        similarity_matrix = torch.matmul(z, z.T) / self.temperature  # (bs, bs)
+        # For 2D tensor, use transpose or matrix multiplication with transposed version
+        similarity_matrix = torch.matmul(z, z.transpose(0, 1)) / self.temperature  # (bs, bs)
 
         # Structure-derived positives: based on hypergraph connectivity
         # Samples with similar masking patterns are considered positive
         mask_flat = mask.reshape(mask.shape[0], -1)  # (bs, seq_len*enc_in)
-        mask_similarity = torch.matmul(mask_flat, mask_flat.T) / mask_flat.sum(dim=1, keepdim=True).clamp(min=1)
+        mask_norm = mask_flat.sum(dim=1, keepdim=True).clamp(min=1)  # (bs, 1)
+        
+        # Compute mask similarity using normalized dot product
+        mask_similarity = torch.matmul(mask_flat, mask_flat.transpose(0, 1)) / (mask_norm * mask_norm.transpose(0, 1)).clamp(min=1)  # (bs, bs)
         
         # Threshold for positive pairs
         positive_threshold = 0.7
         positives_mask = (mask_similarity > positive_threshold).float()
         positives_mask.fill_diagonal_(0)  # Remove self-similarity
 
-        # Contrastive loss
-        exp_sim = torch.exp(similarity_matrix)
-        exp_sim_diag_removed = exp_sim - torch.diag(torch.diag(exp_sim))
-        
-        # Positive and negative terms
-        pos_sim = (exp_sim * positives_mask).sum(dim=1)
-        neg_sim = exp_sim_diag_removed.sum(dim=1)
-        
-        # Loss: -log(pos / (pos + neg))
-        loss = -torch.log(pos_sim / (neg_sim + 1e-8) + 1e-8).mean()
+        # Check if there are any positive pairs
+        has_positives = positives_mask.sum() > 0
+
+        if has_positives:
+            # Contrastive loss
+            exp_sim = torch.exp(similarity_matrix)
+            exp_sim_diag_removed = exp_sim - torch.diag(torch.diag(exp_sim))
+            
+            # Positive and negative terms
+            pos_sim = (exp_sim * positives_mask).sum(dim=1)
+            neg_sim = exp_sim_diag_removed.sum(dim=1)
+            
+            # Loss: -log(pos / (pos + neg))
+            # Add small epsilon to avoid log(0) and division by zero
+            loss = -torch.log((pos_sim + 1e-8) / (neg_sim + 1e-8)).mean()
+        else:
+            # If no positive pairs found, use a simpler contrastive approach
+            # Encourage diversity in representations
+            exp_sim = torch.exp(similarity_matrix)
+            
+            # Normalize to create a pseudo loss (push representations apart)
+            loss = torch.log(exp_sim.sum(dim=1)).mean()
 
         return loss, similarity_matrix
 
