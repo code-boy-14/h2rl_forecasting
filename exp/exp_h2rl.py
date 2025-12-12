@@ -378,14 +378,16 @@ class Exp_H2RL(Exp_Basic):
                 preds.append(pred)
                 trues.append(true)
 
-        preds = np.array(preds)
-        trues = np.array(trues)
-        preds = preds.reshape(-1, preds.shape[-2], preds.shape[-1])
-        trues = trues.reshape(-1, trues.shape[-2], trues.shape[-1])
+        # Fix: Concatenate along batch dimension instead of creating nested arrays
+        preds = np.concatenate(preds, axis=0)  # Shape: (total_samples, pred_len, n_vars)
+        trues = np.concatenate(trues, axis=0)  # Shape: (total_samples, pred_len, n_vars)
+
+        # Verify shapes match
+        print(f'Test shapes - Predictions: {preds.shape}, Ground Truth: {trues.shape}')
 
         mae, mse, rmse, mape, mspe = metric(preds, trues)
         print(f'{self.args.seq_len}->{self.args.pred_len}, mse:{mse:.3f}, mae:{mae:.3f}')
-        
+
         f = open("./outputs/score.txt", 'a')
         f.write(f'{self.args.seq_len}->{self.args.pred_len}, {mse:.3f}, {mae:.3f}\n')
         f.close()
