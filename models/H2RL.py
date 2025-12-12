@@ -58,7 +58,8 @@ class Model(nn.Module):
             self.forecast_head = ForecastHead(
                 seq_len=configs.seq_len,
                 d_model=configs.d_model,
-                pred_len=configs.pred_len
+                pred_len=configs.pred_len,
+                enc_in=configs.enc_in  # ADD THIS PARAMETER
             )
 
         self.layer_norm = nn.LayerNorm(configs.d_model)
@@ -194,14 +195,15 @@ class Model(nn.Module):
                 incidence_matrices, hyperedge_weights, mask
             )
 
+        # Aggregate representations
+        time_repr = time_nodes.mean(dim=(1, 2))  # (bs, d_model)
+        freq_repr = freq_nodes.mean(dim=(1, 2))  # (bs, d_model)
+        stat_repr = stat_nodes.mean(dim=(1, 2))  # (bs, d_model)
+
+        combined_repr = torch.cat([time_repr, freq_repr, stat_repr], dim=-1)  # (bs, 3*d_model)
+
         # Forecast
-        combined_repr = torch.cat([
-            time_nodes.mean(dim=1),
-            freq_nodes.mean(dim=1),
-            stat_nodes.mean(dim=1)
-        ], dim=-1)
-        
-        dec_out = self.forecast_head(combined_repr)
+        dec_out = self.forecast_head(combined_repr)  # (bs, pred_len, n_vars)
 
         # De-normalization
         dec_out = dec_out * (stdev[:, 0, :].unsqueeze(1).repeat(1, self.pred_len, 1))
@@ -642,14 +644,15 @@ class StructuralContrastiveLearning(nn.Module):
 class ForecastHead(nn.Module):
     """Forecasting head for final prediction"""
 
-    def __init__(self, seq_len, d_model, pred_len):
+    def __init__(self, seq_len, d_model, pred_len, enc_in):
         super().__init__()
-        self.flatten = nn.Flatten()
+        self.pred_len = pred_len
+        self.enc_in = enc_in
         self.fc = nn.Sequential(
             nn.Linear(3 * d_model, 256),
             nn.ReLU(),
             nn.Dropout(0.1),
-            nn.Linear(256, pred_len)
+            nn.Linear(256, pred_len * enc_in)
         )
 
     def forward(self, x):
@@ -657,5 +660,6 @@ class ForecastHead(nn.Module):
         x: (bs, 3*d_model)
         Returns: (bs, pred_len, enc_in)
         """
-        out = self.fc(x)  # (bs, pred_len)
-        return out.unsqueeze(-1)  # (bs, pred_len, 1)
+        out = self.fc(x)  # (bs, pred_len * enc_in)
+        out = out.reshape(x.shape[0], self.pred_len, self.enc_in)  # (bs, pred_len, enc_in)
+        return out
