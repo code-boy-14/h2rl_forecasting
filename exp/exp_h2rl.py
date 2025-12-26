@@ -35,11 +35,37 @@ class Exp_H2RL(Exp_Basic):
             print(f"Loading checkpoint: {self.args.load_checkpoints}")
             try:
                 checkpoint = torch.load(self.args.load_checkpoints, map_location=self.device)
+                
+                # Extract state dict
                 if 'model_state_dict' in checkpoint:
-                    model.load_state_dict(checkpoint['model_state_dict'])
+                    pretrained_dict = checkpoint['model_state_dict']
                 else:
-                    model.load_state_dict(checkpoint)
-                print("Checkpoint loaded successfully!")
+                    pretrained_dict = checkpoint
+                
+                # Filter out task-specific heads (keep only encoder parameters)
+                encoder_dict = {}
+                head_keys_skipped = []
+                
+                for k, v in pretrained_dict.items():
+                    # Skip task-specific heads
+                    if 'reconstruction_head' in k or 'forecast_head' in k:
+                        head_keys_skipped.append(k)
+                        continue
+                    encoder_dict[k] = v
+                
+                # Load encoder parameters with strict=False
+                missing_keys, unexpected_keys = model.load_state_dict(encoder_dict, strict=False)
+                
+                # Count actual parameters loaded
+                loaded_params = sum(p.numel() for k, p in model.named_parameters() if k in encoder_dict)
+                total_params = sum(p.numel() for p in model.parameters())
+                
+                # Report what was loaded
+                print(f"✓ Successfully loaded {loaded_params:,} / {total_params:,} parameters from checkpoint")
+                print(f"✓ Loaded {len(encoder_dict)} weight tensors (skipped {len(head_keys_skipped)} head tensors)")
+                print(f"✓ Missing keys (randomly initialized): {len(missing_keys)}")
+                print(f"✓ Forecast head initialized randomly for fine-tuning")
+                
             except Exception as e:
                 print(f"Warning: Could not load checkpoint: {str(e)}")
                 print("Starting from scratch...")
@@ -386,8 +412,8 @@ class Exp_H2RL(Exp_Basic):
         print(f'Test shapes - Predictions: {preds.shape}, Ground Truth: {trues.shape}')
 
         mae, mse, rmse, mape, mspe = metric(preds, trues)
-        print(f'{self.args.seq_len}->{self.args.pred_len}, mse:{mse:.3f}, mae:{mae:.3f}')
+        print(f'{self.args.data} {self.args.seq_len}->{self.args.pred_len}, mse:{mse:.3f}, mae:{mae:.3f}')
 
         f = open("./outputs/score.txt", 'a')
-        f.write(f'{self.args.seq_len}->{self.args.pred_len}, {mse:.3f}, {mae:.3f}\n')
+        f.write(f'{self.args.data} {self.args.seq_len}->{self.args.pred_len}, {mse:.3f}, {mae:.3f}\n')
         f.close()
